@@ -11,9 +11,16 @@ from app.engine import (
     compare_sensor,
     evaluate_batch,
     evaluate_quality_gate,
+    preview_submission,
     query_sample,
 )
-from app.storage import BatchStore, StoredEvent
+from app.storage import (
+    BatchStore,
+    IdempotencyConflict,
+    StoredEvent,
+    apply_event,
+    canonical_event,
+)
 
 
 def _ev(rev, parent, start=0, end=10, value=1.0, withdrawn=False,
@@ -319,3 +326,89 @@ def test_quality_gate_all_invalid_sensor_has_empty_window():
     assert doc["status"] == "pass"
     assert doc["scanned_start_ns"] is None and doc["scanned_end_ns"] is None
     assert doc["violations"] == [] and doc["gaps"] == []
+
+
+# ---------------------------------------------------------------------------
+# Submission preview
+# ---------------------------------------------------------------------------
+
+
+def test_preview_empty_batch_projects_root_revision():
+    store = BatchStore()
+    doc = preview_submission("B", _ev("v1", "ROOT", 0, 100, value=1.0), store)
+    assert doc["status"] == "acceptable"
+    assert doc["missing_parents_added"] == [] and doc["missing_parents_removed"] == []
+    assert [(c["start_ns"], c["end_ns"]) for c in doc["effective_changes"]] == [
+        (0, 100)
+    ]
+    assert doc["effective_changes"][0]["before"] is None
+    assert doc["effective_changes"][0]["after"]["value"] == 1.0
+    # The source store stays untouched (no batch is even materialized).
+    assert store.events == {}
+
+
+def test_preview_blocked_candidate_only_changes_gap_set():
+    store = _gate_store([_ev("r", "ROOT", 0, 100, value=1.0)])
+    before_hash = evaluate_batch("B", store)["timeline_hash"]
+    doc = preview_submission("B", _ev("o", "ghost", 10, 20, value=9.0), store)
+    assert doc["status"] == "acceptable"
+    assert doc["before_timeline_hash"] == before_hash
+    assert doc["after_timeline_hash"] == before_hash
+    assert doc["effective_changes"] == []
+    assert doc["missing_parents_added"] == ["ghost"]
+    assert doc["missing_parents_removed"] == []
+    assert store.events.keys() == {"r"}
+    assert "ghost" not in store.idempotency
+
+
+def test_preview_backfill_activates_descendants_and_clears_gap():
+    store = _gate_store([
+        _ev("v3", "v2", 100, 200, value=3.5),
+        _ev("v2", "v1", 0, 300, value=2.0),
+    ])
+    doc = preview_submission("B", _ev("v1", "ROOT", 0, 300, value=1.0), store)
+    assert doc["missing_parents_removed"] == ["v1"]
+    assert doc["missing_parents_added"] == []
+    assert [
+        (c["start_ns"], c["end_ns"], c["before"], c["after"]["value"])
+        for c in doc["effective_changes"]
+    ] == [
+        (0, 100, None, 2.0),
+        (100, 200, None, 3.5),
+        (200, 300, None, 2.0),
+    ]
+    assert doc["projected_result"]["complete"] is True
+    # Still only the two blocked events in the live store.
+    assert set(store.events) == {"v2", "v3"}
+
+
+def test_preview_exact_replay_is_duplicate_and_inert():
+    event = _ev("v1", "ROOT", 0, 10, value=1.0)
+    store = BatchStore()
+    apply_event(store, event)
+    assert store.idempotency == {"k-v1": canonical_event(event)}
+    before_hash = evaluate_batch("B", store)["timeline_hash"]
+    doc = preview_submission("B", event, store)
+    assert doc["status"] == "duplicate"
+    assert doc["before_timeline_hash"] == doc["after_timeline_hash"] == before_hash
+    assert doc["effective_changes"] == []
+    assert len(store.events) == 1
+
+
+def test_preview_conflict_raises_and_remains_write_free():
+    store = _gate_store([_ev("v1", "ROOT", 0, 10, value=1.0, key="same")])
+    try:
+        preview_submission("B", _ev("v2", "ROOT", 0, 10, value=2.0, key="same"), store)
+    except IdempotencyConflict:
+        pass
+    else:  # pragma: no cover - expected raise
+        raise AssertionError("expected IdempotencyConflict")
+    assert set(store.events) == {"v1"}
+    assert set(store.idempotency) == {"same"}
+
+
+def test_preview_provenance_only_swap_is_not_effective_change():
+    store = _gate_store([_ev("v1", "ROOT", 0, 100, value=1.0)])
+    doc = preview_submission("B", _ev("v2", "v1", 0, 100, value=1.0), store)
+    assert doc["effective_changes"] == []
+    assert doc["before_timeline_hash"] != doc["after_timeline_hash"]

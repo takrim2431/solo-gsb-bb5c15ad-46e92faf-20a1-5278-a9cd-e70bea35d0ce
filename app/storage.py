@@ -78,29 +78,7 @@ class EventStore:
         :class:`IdempotencyConflict` on a key reused with other content.
         """
         with self._lock:
-            batch = self._batches[event.batch_id]
-            canonical = canonical_event(event)
-
-            previous = batch.idempotency.get(event.idempotency_key)
-            if previous is not None:
-                if previous == canonical:
-                    return "duplicate"
-                raise IdempotencyConflict(event.idempotency_key)
-
-            existing = batch.events.get(event.revision_id)
-            if existing is not None:
-                # Same revision_id submitted under a new idempotency key.
-                if canonical_event(existing) != canonical:
-                    raise IdempotencyConflict(event.idempotency_key)
-                # Identical content but different key: still an exact replay;
-                # register the new key so both forms deduplicate going forward.
-                batch.idempotency[event.idempotency_key] = canonical
-                return "duplicate"
-
-            batch.events[event.revision_id] = event
-            batch.revision_sensor[event.revision_id] = event.sensor_id
-            batch.idempotency[event.idempotency_key] = canonical
-            return "accepted"
+            return apply_event(self._batches[event.batch_id], event)
 
     def reset(self) -> tuple[int, int]:
         with self._lock:
@@ -119,6 +97,18 @@ class EventStore:
         with self._lock:
             return self._batches.get(batch_id)
 
+    def snapshot_batch(self, batch_id: str) -> BatchStore:
+        """Detached copy of one batch (an empty store when it does not exist).
+
+        The copy shares the immutable :class:`StoredEvent` values but owns
+        fresh mappings, so a preview may "apply" its candidate event without
+        touching the live store. Call while holding :attr:`lock`.
+        """
+        batch = self._batches.get(batch_id)
+        if batch is None:
+            return BatchStore()
+        return projected_batch(batch)
+
     def stats(self) -> tuple[int, int]:
         with self._lock:
             return len(self._batches), sum(
@@ -129,6 +119,52 @@ class EventStore:
 # ---------------------------------------------------------------------------
 # Deterministic serialization helpers
 # ---------------------------------------------------------------------------
+
+
+def apply_event(batch: BatchStore, event: StoredEvent) -> str:
+    """Apply the ingest/idempotency rules of ``EventStore.add`` to one batch.
+
+    Returns ``"accepted"`` or ``"duplicate"`` and raises
+    :class:`IdempotencyConflict` on a key (or same revision id) reused with
+    different content. Lock-free so both the live ingest path and the
+    write-free preview projection share exactly the same rules.
+    """
+    canonical = canonical_event(event)
+
+    previous = batch.idempotency.get(event.idempotency_key)
+    if previous is not None:
+        if previous == canonical:
+            return "duplicate"
+        raise IdempotencyConflict(event.idempotency_key)
+
+    existing = batch.events.get(event.revision_id)
+    if existing is not None:
+        # Same revision_id submitted under a new idempotency key.
+        if canonical_event(existing) != canonical:
+            raise IdempotencyConflict(event.idempotency_key)
+        # Identical content but different key: still an exact replay;
+        # register the new key so both forms deduplicate going forward.
+        batch.idempotency[event.idempotency_key] = canonical
+        return "duplicate"
+
+    batch.events[event.revision_id] = event
+    batch.revision_sensor[event.revision_id] = event.sensor_id
+    batch.idempotency[event.idempotency_key] = canonical
+    return "accepted"
+
+
+def projected_batch(batch: BatchStore) -> BatchStore:
+    """Shallow detached copy of one batch, for preview projections.
+
+    Mapping contents are copied (inserts during a preview never reach the
+    live store); the contained :class:`StoredEvent` values are immutable and
+    shared safely.
+    """
+    return BatchStore(
+        events=dict(batch.events),
+        revision_sensor=dict(batch.revision_sensor),
+        idempotency=dict(batch.idempotency),
+    )
 
 
 def canonical_event(event: StoredEvent) -> str:

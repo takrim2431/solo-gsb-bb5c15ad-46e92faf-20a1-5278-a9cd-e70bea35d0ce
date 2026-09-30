@@ -264,6 +264,57 @@ class IngestResponse(StrictModel):
     result: BatchResult
 
 
+class EffectiveChangeInterval(StrictModel):
+    """One half-open span whose effective state/value/unit would change.
+
+    ``before``/``after`` carry the effective payload (state/value/unit) on
+    each side; ``null`` means uncovered. A span whose only difference is the
+    winning revision provenance is deliberately not reported: changing the
+    source revision alone is not an effective-value change.
+    """
+
+    start_ns: int
+    end_ns: int
+    before: Optional[CompareSide] = None
+    after: Optional[CompareSide] = None
+
+
+class PreviewResponse(StrictModel):
+    """Write-free preview of one revision's impact on its batch.
+
+    Computed from a consistent batch snapshot under the same validation,
+    idempotency and causal-fold rules as ingest, but stores nothing and does
+    not claim the idempotency key:
+
+    * ``status``: ``acceptable`` when the submission would be accepted, or
+      ``duplicate`` when it is an exact replay (same key+payload or same
+      revision+content); idempotency conflicts still surface as ``409``;
+    * ``before_timeline_hash`` / ``after_timeline_hash``: batch timeline hash
+      of the snapshot and of the projected post-submission batch;
+    * ``effective_changes``: half-open spans where effective state/value/unit
+      changes for this sensor (provenance-only swaps excluded);
+    * ``missing_parents_added`` / ``missing_parents_removed``: missing parent
+      revisions the candidate introduces or clears (backfilling a parent may
+      activate blocked descendants, which is reflected in the projected
+      result even when a blocked candidate itself does not touch the
+      timeline);
+    * ``projected_result``: the full batch result as it would stand after the
+      submission.
+    """
+
+    batch_id: str
+    sensor_id: str
+    revision_id: str
+    idempotency_key: str
+    status: Literal["acceptable", "duplicate"]
+    before_timeline_hash: str
+    after_timeline_hash: str
+    effective_changes: list[EffectiveChangeInterval] = Field(default_factory=list)
+    missing_parents_added: list[str] = Field(default_factory=list)
+    missing_parents_removed: list[str] = Field(default_factory=list)
+    projected_result: BatchResult
+
+
 class ResetResponse(StrictModel):
     status: Literal["reset"]
     batches_removed: int

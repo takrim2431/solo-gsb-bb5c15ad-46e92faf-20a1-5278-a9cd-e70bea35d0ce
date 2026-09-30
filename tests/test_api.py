@@ -685,3 +685,312 @@ def test_openapi_lists_quality_gate_endpoint(client):
         "min_duration_ns",
         "missing_policy",
     } <= set(props)
+
+
+# ---------------------------------------------------------------------------
+# Submission preview (dry run)
+# ---------------------------------------------------------------------------
+
+
+def _preview(client, event, batch="B1"):
+    return client.post(f"/api/v1/batches/{batch}/events/preview", json=event)
+
+
+def test_preview_nonexistent_batch_is_previewed_as_empty(client):
+    event = _event("v1", "ROOT", 0, 100, value=1.0, batch="B42")
+    r = _preview(client, event, batch="B42")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "acceptable"
+    assert body["missing_parents_added"] == []
+    assert body["missing_parents_removed"] == []
+    [change] = body["effective_changes"]
+    assert (change["start_ns"], change["end_ns"]) == (0, 100)
+    assert change["before"] is None
+    assert change["after"] == {"state": "calibrated", "value": 1.0, "unit": "mm"}
+    assert body["projected_result"]["complete"] is True
+    # Nothing was written: the batch still does not exist.
+    assert client.get("/api/v1/batches/B42/result").status_code == 404
+
+
+def test_preview_does_not_store_event_or_claim_idempotency_key(client):
+    event = _event("v1", "ROOT", 0, 10, value=1.0, key="once")
+    _preview(client, event)
+    assert client.get("/api/v1/batches/B1/result").status_code == 404
+    # The key is still free: a real submission with it is "accepted", and the
+    # preview itself did not register the revision either.
+    r = _post(client, event)
+    assert r.json()["status"] == "accepted"
+    assert r.json()["result"]["revisions_total"] == 1
+
+
+def test_preview_acceptable_new_child_reports_effective_change_intervals(client):
+    _post(client, _event("v1", "ROOT", 0, 300, value=1.0))
+    before = client.get("/api/v1/batches/B1/result").json()["timeline_hash"]
+    r = _preview(client, _event("v2", "v1", 100, 200, value=3.5, key="pv2"))
+    body = r.json()
+    assert body["status"] == "acceptable"
+    assert body["before_timeline_hash"] == before
+    assert body["after_timeline_hash"] != before
+    [change] = body["effective_changes"]
+    assert (change["start_ns"], change["end_ns"]) == (100, 200)
+    assert change["before"] == {"state": "calibrated", "value": 1.0, "unit": "mm"}
+    assert change["after"] == {"state": "calibrated", "value": 3.5, "unit": "mm"}
+    assert body["missing_parents_added"] == []
+    assert body["missing_parents_removed"] == []
+    assert body["projected_result"]["complete"] is True
+    # The after-hash is exactly what a real submission produces afterwards.
+    real = _post(client, _event("v2", "v1", 100, 200, value=3.5, key="pv2"))
+    assert real.json()["result"]["timeline_hash"] == body["after_timeline_hash"]
+
+
+def test_preview_blocked_candidate_reflects_gap_without_timeline_change(client):
+    _post(client, _event("v1", "ROOT", 0, 300, value=1.0))
+    before_hash = client.get("/api/v1/batches/B1/result").json()["timeline_hash"]
+    r = _preview(
+        client, _event("orphan", "ghost", 100, 200, value=9.0, key="po")
+    )
+    body = r.json()
+    assert body["status"] == "acceptable"
+    # The blocked candidate cannot touch the folded timeline ...
+    assert body["effective_changes"] == []
+    assert body["before_timeline_hash"] == before_hash
+    assert body["after_timeline_hash"] == before_hash
+    # ... but the new backfillable gap it introduces is still reported.
+    assert body["missing_parents_added"] == ["ghost"]
+    assert body["missing_parents_removed"] == []
+    assert body["projected_result"]["complete"] is False
+    gap = body["projected_result"]["gaps"][0]
+    assert gap["missing_revision_id"] == "ghost"
+    assert gap["awaited_by"] == ["orphan"]
+    # State is unchanged: the ghost gap is not persisted by the preview.
+    real = client.get("/api/v1/batches/B1/result").json()
+    assert real["complete"] is True
+    assert real["gaps"] == []
+
+
+def test_preview_backfilling_parent_activates_blocked_descendants(client):
+    # v3 -> v2 -> v1 (missing); v2 covers [40,260)=2.0, v3 [100,200)=3.5.
+    _post(client, _event("v3", "v2", 100, 200, value=3.5, key="k3"))
+    _post(client, _event("v2", "v1", 40, 260, value=2.0, key="k2"))
+    _post(client, _event("r", "ROOT", 0, 300, value=1.0, key="kr"))
+    before = client.get("/api/v1/batches/B1/result").json()
+    assert [g["missing_revision_id"] for g in before["gaps"]] == ["v1"]
+
+    r = _preview(client, _event("v1", "ROOT", 0, 300, value=1.0, key="pv1"))
+    body = r.json()
+    assert body["status"] == "acceptable"
+    assert body["missing_parents_removed"] == ["v1"]
+    assert body["missing_parents_added"] == []
+    assert [
+        (c["start_ns"], c["end_ns"], c["before"]["value"], c["after"]["value"])
+        for c in body["effective_changes"]
+    ] == [
+        (40, 100, 1.0, 2.0),
+        (100, 200, 1.0, 3.5),
+        (200, 260, 1.0, 2.0),
+    ]
+    assert body["projected_result"]["complete"] is True
+    assert body["projected_result"]["gaps"] == []
+
+
+def test_preview_duplicate_payload_returns_duplicate_without_changes(client):
+    event = _event("v1", "ROOT", 0, 10, value=1.0)
+    _post(client, event)
+    r = _preview(client, event)
+    body = r.json()
+    assert body["status"] == "duplicate"
+    assert body["effective_changes"] == []
+    assert body["before_timeline_hash"] == body["after_timeline_hash"]
+    assert body["missing_parents_added"] == []
+    assert body["missing_parents_removed"] == []
+    assert body["projected_result"]["revisions_total"] == 1
+
+
+def test_preview_same_revision_same_content_new_key_is_duplicate(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, key="k1"))
+    r = _preview(client, _event("v1", "ROOT", 0, 10, value=1.0, key="k2"))
+    assert r.json()["status"] == "duplicate"
+    # The alternative key was not claimed: a conflicting replay via the real
+    # endpoint still gets 409 (same revision, different payload).
+    conflict = _post(
+        client, _event("v1", "ROOT", 0, 10, value=9.0, key="k2")
+    )
+    assert conflict.status_code == 409
+
+
+def test_preview_same_key_different_payload_conflicts_409(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, key="same"))
+    r = _preview(client, _event("v2", "ROOT", 0, 10, value=2.0, key="same"))
+    assert r.status_code == 409
+    assert "same" in r.json()["detail"]
+    # The conflicted payload was not stored.
+    assert client.get("/api/v1/batches/B1/result").json()["revisions_total"] == 1
+
+
+def test_preview_same_revision_different_content_conflicts_409(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, key="k1"))
+    r = _preview(client, _event("v1", "ROOT", 0, 10, value=9.0, key="k2"))
+    assert r.status_code == 409
+
+
+def test_preview_invalid_payload_is_422(client):
+    # Bad interval.
+    assert _preview(client, _event("r", "ROOT", 50, 40, value=1.0)).status_code == 422
+    # Missing value on a non-withdrawn fragment.
+    assert _preview(client, _event("r2", "ROOT", 0, 10)).status_code == 422
+    # Reserved revision id.
+    assert (
+        _preview(client, _event("ROOT", "ROOT", 0, 10, value=1.0, key="kr")).status_code
+        == 422
+    )
+    # Unknown extra field.
+    extra = _event("r3", "ROOT", 0, 10, value=1.0)
+    extra["surprise"] = 1
+    assert _preview(client, extra).status_code == 422
+    # Path/body batch mismatch.
+    mismatch = _event("r4", "ROOT", 0, 10, value=1.0, batch="OTHER")
+    assert client.post(
+        "/api/v1/batches/B1/events/preview", json=mismatch
+    ).status_code == 422
+
+
+def test_preview_provenance_only_change_is_not_effective_change(client):
+    # Descendant overwrites the parent's window with the same value and unit:
+    # only the winning revision (provenance) changes, not the effective value.
+    _post(client, _event("v1", "ROOT", 0, 300, value=1.0))
+    body = _preview(
+        client, _event("v2", "v1", 100, 200, value=1.0, key="k2")
+    ).json()
+    assert body["effective_changes"] == []
+    # Provenance is still part of the folded content, so the batch hash moves.
+    assert body["before_timeline_hash"] != body["after_timeline_hash"]
+
+
+def test_preview_withdrawn_tombstone_reports_erasure_spans(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=5.0))
+    body = _preview(
+        client, _event("w", "v1", 30, 70, withdrawn=True, value=None, key="kw")
+    ).json()
+    [change] = body["effective_changes"]
+    assert (change["start_ns"], change["end_ns"]) == (30, 70)
+    assert change["before"] == {"state": "calibrated", "value": 5.0, "unit": "mm"}
+    assert change["after"] == {"state": "withdrawn", "value": None, "unit": None}
+
+
+def test_preview_other_sensors_and_sensors_are_independent(client):
+    _post(client, _event("x", "ROOT", 0, 10, value=1.0, sensor="SX", key="kx"))
+    body = _preview(
+        client, _event("y", "ghost", 0, 10, value=2.0, sensor="SY", key="ky")
+    ).json()
+    assert body["sensor_id"] == "SY"
+    assert body["missing_parents_added"] == ["ghost"]
+    # The blocked candidate changes no effective span of SY's (empty) fold.
+    assert body["effective_changes"] == []
+    assert body["projected_result"]["sensors"]
+    # Nothing persisted.
+    real = client.get("/api/v1/batches/B1/result").json()
+    assert len(real["sensors"]) == 1
+    assert real["gaps"] == []
+
+
+def test_preview_equivalence_with_real_submission_across_scenarios(client):
+    # For the same event payload, the preview's projected hash/gaps equal what
+    # the real ingest returns, whatever the starting state of the batch.
+    scenarios = [
+        [],
+        [_event("v2", "v1", 10, 20, value=2.0)],
+        [_event("r", "ROOT", 0, 100, value=5.0)],
+        [
+            _event("c1", "c2", 0, 10, value=1.0, key="c1"),
+            _event("c2", "c1", 0, 10, value=2.0, key="c2"),
+        ],
+    ]
+    candidate = _event("v1", "ROOT", 0, 50, value=7.0, key="cand")
+    for prior in scenarios:
+        client.post("/admin/reset")
+        for e in prior:
+            _post(client, e)
+        preview = _preview(client, candidate).json()
+        ingest = _post(client, candidate).json()["result"]
+        assert preview["after_timeline_hash"] == ingest["timeline_hash"]
+        assert [
+            (g["missing_revision_id"], g["awaited_by"])
+            for g in preview["projected_result"]["gaps"]
+        ] == [(g["missing_revision_id"], g["awaited_by"]) for g in ingest["gaps"]]
+        assert (
+            preview["projected_result"]["revisions_total"]
+            == ingest["revisions_total"]
+        )
+
+
+def test_preview_is_consistent_under_concurrent_ingest(client):
+    # TestClient serializes requests on one portal, so exercise the same
+    # lock-guarded store/engine entry points the endpoints use, from threads.
+    import threading
+
+    from app import main as main_module
+    from app.engine import evaluate_batch, preview_submission
+    from app.storage import StoredEvent
+
+    def stored(rev, parent, key, value):
+        return StoredEvent(
+            batch_id="B1",
+            sensor_id="S1",
+            revision_id=rev,
+            parent_id=parent,
+            idempotency_key=key,
+            start_ns=0,
+            end_ns=10,
+            value=float(value),
+            unit="mm",
+            withdrawn=False,
+        )
+
+    main_module.store.add(stored("v1", "ROOT", "kv1", 1.0))
+    errors: list[Exception] = []
+
+    def preview_loop() -> None:
+        try:
+            for i in range(100):
+                with main_module.store.lock:
+                    snapshot = main_module.store.snapshot_batch("B1")
+                    doc = preview_submission(
+                        "B1", stored(f"p{i}", "ROOT", f"kp{i}", i), snapshot
+                    )
+                # Every preview sees an internally consistent snapshot: its
+                # before-hash must be some observed batch state.
+                assert len(doc["before_timeline_hash"]) == 64
+                assert len(doc["after_timeline_hash"]) == 64
+        except Exception:  # pragma: no cover - concurrency guard
+            errors.append("preview loop raised")
+
+    def ingest_loop() -> None:
+        try:
+            for i in range(100):
+                main_module.store.add(stored(f"c{i}", "v1", f"kc{i}", i))
+        except Exception:  # pragma: no cover - concurrency guard
+            errors.append("ingest loop raised")
+
+    t1 = threading.Thread(target=preview_loop)
+    t2 = threading.Thread(target=ingest_loop)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert not errors
+    with main_module.store.lock:
+        result = evaluate_batch("B1", main_module.store.get_batch("B1"))
+    # Only the 100 real ingests landed; preview revisions/keys never stuck.
+    batch = main_module.store.get_batch("B1")
+    assert result["revisions_total"] == 101
+    assert {f"p{i}" for i in range(100)} & set(batch.events) == set()
+    assert {f"kp{i}" for i in range(100)} & set(batch.idempotency) == set()
+
+
+def test_openapi_lists_preview_endpoint(client):
+    spec = client.get("/openapi.json").json()
+    path = spec["paths"]["/api/v1/batches/{batch_id}/events/preview"]["post"]
+    ref = path["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+    assert ref.endswith("/PreviewResponse")
+    assert "409" in path["responses"]

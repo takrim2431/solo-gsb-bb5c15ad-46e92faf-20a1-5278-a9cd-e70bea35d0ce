@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .models import ROOT_PARENT
-from .storage import BatchStore, StoredEvent
+from .storage import BatchStore, StoredEvent, apply_event, projected_batch
 # Revision states (reachable from a known root vs. waiting on a missing
 # ancestor vs. structurally unusable, e.g. part of a parent cycle).
 GROUNDED = "grounded"
@@ -470,6 +470,116 @@ def evaluate_batch(batch_id: str, store: BatchStore) -> dict:
         "revisions_invalid": totals[INVALID],
         "complete": not gaps_out and totals[INVALID] == 0 and revisions_total > 0,
         "timeline_hash": timeline_hash,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Submission preview (dry run)
+# ---------------------------------------------------------------------------
+
+
+def _fold_sensor_events(
+    sensor_events: dict[str, StoredEvent],
+) -> tuple[list[Segment], dict[str, str]]:
+    """Fold one sensor's grounded revisions; returns ``(segments, states)``."""
+    states, depths = classify_sensor(sensor_events)
+    segments = build_timeline(
+        [e for e in sensor_events.values() if states[e.revision_id] == GROUNDED],
+        depths,
+    )
+    return segments, states
+
+
+def _sensor_snapshot(
+    store: BatchStore, sensor_id: str
+) -> Optional[tuple[list[Segment], dict[str, str], dict[str, StoredEvent]]]:
+    """Folded timeline and classification of one sensor in a batch snapshot."""
+    sensor_events = find_sensor_events(store, sensor_id)
+    if sensor_events is None:
+        return None
+    segments, states = _fold_sensor_events(sensor_events)
+    return segments, states, sensor_events
+
+
+def _missing_parents(
+    batch_id: str,
+    sensor_id: str,
+    sensor_events: dict[str, StoredEvent],
+    states: dict[str, str],
+) -> set[str]:
+    """Set of missing parent revisions reported as gaps for this sensor."""
+    return {
+        gap["missing_revision_id"]
+        for gap in collect_gaps(batch_id, sensor_events, states)
+        if gap["sensor_id"] == sensor_id
+    }
+
+
+def preview_submission(batch_id: str, event: StoredEvent, store: BatchStore) -> dict:
+    """Dry-run one ingest against a consistent batch snapshot.
+
+    Reuses the exact validation outcome of the ingest path (the caller
+    validates the payload beforehand), the same idempotency rules via
+    :func:`~app.storage.apply_event`, and the same causal fold. The snapshot
+    is copied first, so no event is stored and no idempotency key is claimed.
+    A batch that does not exist is projected from an empty batch.
+
+    Returns the duplicate/acceptable verdict, the before/after batch timeline
+    hashes, the half-open spans on which the sensor's effective state/value/
+    unit would change (a provenance-only revision swap does not count), and
+    the missing-parent gap sets introduced and removed by the candidate.
+    Raises :class:`~app.storage.IdempotencyConflict` with the same 409
+    semantics as a real submission.
+    """
+    before_doc = evaluate_batch(batch_id, store)
+
+    before_sensor = _sensor_snapshot(store, event.sensor_id)
+    before_gaps: set[str] = set()
+    if before_sensor is not None:
+        _, before_states, before_events = before_sensor
+        before_gaps = _missing_parents(batch_id, event.sensor_id, before_events, before_states)
+
+    projection = projected_batch(store)
+    status = apply_event(projection, event)
+
+    after_doc = evaluate_batch(batch_id, projection)
+    after_segments, after_states, after_events = _sensor_snapshot(
+        projection, event.sensor_id
+    )
+    after_gaps = _missing_parents(
+        batch_id, event.sensor_id, after_events, after_states
+    )
+
+    before_segments = before_sensor[0] if before_sensor is not None else []
+    # Reuse the cross-batch diff sweep: it compares effective state only, so
+    # equal spans (including provenance-only changes of revision id) drop out.
+    diffs = [
+        interval
+        for interval in compare_segments(before_segments, after_segments)
+        if interval["kind"] != EQUAL
+    ]
+    effective_changes = [
+        {
+            "start_ns": interval["start_ns"],
+            "end_ns": interval["end_ns"],
+            "before": interval["left"],
+            "after": interval["right"],
+        }
+        for interval in diffs
+    ]
+
+    return {
+        "batch_id": batch_id,
+        "sensor_id": event.sensor_id,
+        "revision_id": event.revision_id,
+        "idempotency_key": event.idempotency_key,
+        "status": "duplicate" if status == "duplicate" else "acceptable",
+        "before_timeline_hash": before_doc["timeline_hash"],
+        "after_timeline_hash": after_doc["timeline_hash"],
+        "effective_changes": effective_changes,
+        "missing_parents_added": sorted(after_gaps - before_gaps),
+        "missing_parents_removed": sorted(before_gaps - after_gaps),
+        "projected_result": after_doc,
     }
 
 

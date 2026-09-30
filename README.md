@@ -4,7 +4,8 @@
 **乱序、时间重叠且可能撤回**的测量片段修订（measurement-fragment revisions），
 按照**版本因果关系**与**时间区间切分规则**，生成一条**确定性**的有效标定时间线；
 当修订引用了尚未上传的父版本时，返回**可补传的缺口清单（gaps）**；
-重复提交通过幂等键保证**幂等**；还可对**两个批次的同一传感器**做
+重复提交通过幂等键保证**幂等**；提交前可用**预览（preview）**接口在零写入的
+批次快照上推演本次修订的影响；还可对**两个批次的同一传感器**做
 **差异对比审计（compare）**，并对单个传感器的折叠时间线做
 **质量门禁评估（quality gate）**。全部状态保存在**进程内存**中，可随时重置。
 
@@ -81,6 +82,18 @@ pytest -q
   - 相同 `idempotency_key` + 完全相同负载 → 返回 `status="duplicate"`，状态不变；
   - 相同 `idempotency_key` 但负载不同（或同 `revision_id` 内容不同）→ `409 Conflict`；
   - 同一 `revision_id` + 相同内容即使换了幂等键也算重复。
+- **提交前预览**（见 4.2）与真实提交共用同一套校验、幂等判定与因果折叠，
+  但只在批次快照的**副本**上推演：不写入事件、不占用幂等键。预览给出
+  `acceptable` / `duplicate` 判定、预览前后的整批 `timeline_hash`、该传感器
+  **有效状态/值/单位**发生变化的半开区间（仅来源修订变化、有效值不变的
+  “换源”不算变化），以及本次**新增/消除的缺失父修订**清单：
+  - 被阻塞的候选修订不改变折叠时间线（前后哈希相同），但仍会在
+    `missing_parents_added` 中反映它引入的缺口；
+  - 候选修订本身是缺失父修订时，会激活此前 blocked 的后代，其影响同时
+    体现在变化区间与 `missing_parents_removed` 中；
+  - 尚不存在的批次按**空批次**预览；冲突（409）与非法负载（422）语义与
+    真实提交完全一致；快照与推演在同一把锁内完成，并发提交/预览各自基于
+    一致的批次快照。
 - 结果中包含两个 SHA-256 内容哈希：每个传感器的 `segments_hash`
   和整批的 `timeline_hash`，可用于比对一致性与去重校验。
 - 相邻且状态、值、单位、来源修订完全相同的片段会被合并；来源修订不同则保留边界。
@@ -136,6 +149,74 @@ pytest -q
 - 响应 `200` 中 `status` 为 `accepted` / `duplicate`，并**直接带回该批次当前
   完整结果**（时间线、缺口、计数与哈希），便于流水线即时判断是否可补传；
 - 幂等键冲突或同修订 ID 内容冲突返回 `409`；参数非法返回 `422`。
+
+### `POST /api/v1/batches/{batch_id}/events/preview` — 提交前预览影响（零写入）
+
+请求体与提交接口**完全相同**（同一份负载可先 preview 再提交）。服务在批次
+快照的副本上按现有校验、幂等冲突与因果折叠规则推演，但**不写入任何事件、
+不占用幂等键**：连续预览、预览后再提交都是安全的。尚不存在的批次按空批次
+预览。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | `acceptable` = 提交将被接受；`duplicate` = 完全重放（同键同负载，或同修订同内容换键），提交不会改变状态 |
+| `before_timeline_hash` / `after_timeline_hash` | 预览前 / 推演后整批时间线的 SHA-256；二者相等表示折叠结果不变（如被阻塞候选） |
+| `effective_changes` | 该传感器**有效状态/值/单位**发生变化的半开区间列表，每项含 `start_ns`/`end_ns` 与 `before`/`after`（`{state,value,unit}`，未覆盖为 `null`）。仅获胜来源修订不同、有效值相同的区间**不输出** |
+| `missing_parents_added` | 本次引入的缺失父修订 ID（去重、字典序），可直接照单补传 |
+| `missing_parents_removed` | 本次消除的缺失父修订 ID（候选即被等待的父修订时出现；激活的后代影响见变化区间） |
+| `projected_result` | 推演后批次的完整结果文档，结构与 `GET .../result` 完全一致 |
+
+冲突语义沿用提交接口：相同幂等键负载不同、或同 `revision_id` 内容不同仍返回
+`409`；路径/请求体 `batch_id` 不一致、非法区间、缺值等返回 `422`。预览与提交
+在同一把存储锁内取一致快照，并发提交不会夹在 before/after 之间。
+
+示例（空批次 B42 预览一个缺失父修订的子版本 `v2`）：
+
+```bash
+$ curl -s -X POST localhost:8080/api/v1/batches/B42/events/preview \
+    -H 'Content-Type: application/json' \
+    -d '{"batch_id":"B42","sensor_id":"S1","revision_id":"v2","parent_id":"v1",
+         "idempotency_key":"e2","start_ns":100,"end_ns":200,"value":3.5,"unit":"C"}'
+{
+  "batch_id": "B42",
+  "sensor_id": "S1",
+  "revision_id": "v2",
+  "idempotency_key": "e2",
+  "status": "acceptable",
+  "before_timeline_hash": "4f53cda1…",
+  "after_timeline_hash": "7a87bce5…",
+  "effective_changes": [],
+  "missing_parents_added": ["v1"],
+  "missing_parents_removed": [],
+  "projected_result": { … "complete": false, "gaps": [{"missing_revision_id": "v1", …}] … }
+}
+# 预览后批次仍不存在（GET .../result -> 404）；同负载随后可正式提交。
+```
+
+补传父修订的预览（此前 `v3->v2->[缺失 v1]` 均 blocked；提交 `v1` 后全部激活）：
+
+```bash
+$ curl -s -X POST localhost:8080/api/v1/batches/B42/events/preview \
+    -H 'Content-Type: application/json' \
+    -d '{"batch_id":"B42","sensor_id":"S1","revision_id":"v1","parent_id":"ROOT",
+         "idempotency_key":"e1p","start_ns":0,"end_ns":300,"value":1.0,"unit":"C"}'
+{
+  "status": "acceptable",
+  "missing_parents_added": [],
+  "missing_parents_removed": ["v1"],
+  "effective_changes": [
+    {"start_ns": 40,  "end_ns": 100, "before": {"state":"calibrated","value":1.0,"unit":"C"},
+     "after": {"state":"calibrated","value":2.0,"unit":"C"}},
+    {"start_ns": 100, "end_ns": 200, "before": {"state":"calibrated","value":1.0,"unit":"C"},
+     "after": {"state":"calibrated","value":3.5,"unit":"C"}},
+    {"start_ns": 200, "end_ns": 260, "before": {"state":"calibrated","value":1.0,"unit":"C"},
+     "after": {"state":"calibrated","value":2.0,"unit":"C"}}
+  ],
+  "projected_result": { … "complete": true … }
+}
+```
 
 ### `GET /api/v1/batches/{batch_id}/result` — 查询批次结果
 
@@ -333,6 +414,15 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/events \
 
 # 2) 同一请求重放 → "status":"duplicate"，结果不变
 
+# 2b) 正式提交前先预览同一负载 → 不写入、不占用 e2，返回 acceptable、
+#     前后 timeline_hash、有效值变化区间与新增/消除的缺失父修订清单
+curl -s -X POST localhost:8080/api/v1/batches/B42/events/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B42","sensor_id":"S1","revision_id":"v2","parent_id":"v1",
+       "idempotency_key":"e2","start_ns":100,"end_ns":200,"value":3.5,"unit":"C"}'
+#   -> status="acceptable", effective_changes=[]（候选被阻塞，折叠不变）,
+#      missing_parents_added=["v1"]；批次此时仍未被创建
+
 # 3) 按缺口清单补传父版本 v1（根）→ complete=true，时间线变为
 #    [0,100)=1.0(v1) | [100,200)=3.5(v2) | [200,300)=1.0(v1)
 curl -s -X POST localhost:8080/api/v1/batches/B42/events \
@@ -373,12 +463,12 @@ curl -s -X POST localhost:8080/admin/reset
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / result / sample / compare / quality-gate / reset / health
-│   ├── engine.py     # 因果分类、区间切分折叠、采样点查询、跨批次差异对比、质量门禁扫描、缺口与哈希（纯函数引擎）
-│   ├── storage.py    # 线程安全的内存存储与幂等判定
+│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / reset / health
+│   ├── engine.py     # 因果分类、区间切分折叠、提交前预览、采样点查询、跨批次差异对比、质量门禁扫描、缺口与哈希（纯函数引擎）
+│   ├── storage.py    # 线程安全的内存存储、幂等判定与预览用的快照副本投影
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 67 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测，共 89 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

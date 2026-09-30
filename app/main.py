@@ -1,4 +1,4 @@
-"""FastAPI application: ingest, timeline/sample/compare query and reset endpoints."""
+"""FastAPI application: ingest, preview, timeline/sample/compare query and reset."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from .engine import (
     evaluate_quality_gate,
     evaluate_sample,
     find_sensor_events,
+    preview_submission,
 )
 from .models import (
     BatchResult,
@@ -23,6 +24,7 @@ from .models import (
     HealthResponse,
     IngestResponse,
     MeasurementEvent,
+    PreviewResponse,
     QualityGateRequest,
     QualityGateResponse,
     ResetResponse,
@@ -79,20 +81,8 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok", storage="memory", version=__version__)
 
 
-@app.post(
-    "/api/v1/batches/{batch_id}/events",
-    response_model=IngestResponse,
-    status_code=200,
-    tags="calibration",
-    summary="Submit one measurement-fragment revision",
-)
-def submit_event(batch_id: str, event: MeasurementEvent) -> IngestResponse:
-    if event.batch_id != batch_id:
-        raise HTTPException(
-            status_code=422,
-            detail="batch_id in path and body must match",
-        )
-    stored = StoredEvent(
+def _to_stored_event(event: MeasurementEvent) -> StoredEvent:
+    return StoredEvent(
         batch_id=event.batch_id,
         sensor_id=event.sensor_id,
         revision_id=event.revision_id,
@@ -104,6 +94,22 @@ def submit_event(batch_id: str, event: MeasurementEvent) -> IngestResponse:
         unit=event.unit,
         withdrawn=event.withdrawn,
     )
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/events",
+    response_model=IngestResponse,
+    status_code=200,
+    tags=["calibration"],
+    summary="Submit one measurement-fragment revision",
+)
+def submit_event(batch_id: str, event: MeasurementEvent) -> IngestResponse:
+    if event.batch_id != batch_id:
+        raise HTTPException(
+            status_code=422,
+            detail="batch_id in path and body must match",
+        )
+    stored = _to_stored_event(event)
     with store.lock:
         status = store.add(stored)
         batch = store.get_batch(batch_id)
@@ -116,6 +122,36 @@ def submit_event(batch_id: str, event: MeasurementEvent) -> IngestResponse:
         revision_id=event.revision_id,
         result=BatchResult(**result),
     )
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/events/preview",
+    response_model=PreviewResponse,
+    status_code=200,
+    tags=["calibration"],
+    summary="Preview one revision's impact without storing it",
+    responses={409: {"description": "Idempotency key or revision content conflict"}},
+)
+def preview_event(batch_id: str, event: MeasurementEvent) -> PreviewResponse:
+    """Dry run an ingest against a consistent, write-free batch snapshot.
+
+    The payload is identical to the ingest endpoint's; validation and 422
+    semantics are the same, and idempotency/revision conflicts still surface
+    as 409. Nothing is stored and the idempotency key is not claimed. A batch
+    that does not exist is previewed as an empty batch.
+    """
+    if event.batch_id != batch_id:
+        raise HTTPException(
+            status_code=422,
+            detail="batch_id in path and body must match",
+        )
+    stored = _to_stored_event(event)
+    # Snapshot and projection run under one lock, so a concurrent ingest
+    # cannot interleave between the before/after views.
+    with store.lock:
+        snapshot = store.snapshot_batch(batch_id)
+        doc = preview_submission(batch_id, stored, snapshot)
+    return PreviewResponse(**doc)
 
 
 @app.get(
