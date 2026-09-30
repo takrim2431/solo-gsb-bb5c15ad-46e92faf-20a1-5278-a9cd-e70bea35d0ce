@@ -16,6 +16,7 @@ from .engine import (
     evaluate_quality_gate,
     evaluate_sample,
     find_sensor_events,
+    preview_submission,
 )
 from .models import (
     BatchResult,
@@ -23,12 +24,13 @@ from .models import (
     HealthResponse,
     IngestResponse,
     MeasurementEvent,
+    PreviewResponse,
     QualityGateRequest,
     QualityGateResponse,
     ResetResponse,
     SamplePointResponse,
 )
-from .storage import EventStore, IdempotencyConflict, StoredEvent
+from .storage import BatchStore, EventStore, IdempotencyConflict, StoredEvent
 
 logger = logging.getLogger("calibration")
 
@@ -116,6 +118,58 @@ def submit_event(batch_id: str, event: MeasurementEvent) -> IngestResponse:
         revision_id=event.revision_id,
         result=BatchResult(**result),
     )
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/events:preview",
+    response_model=PreviewResponse,
+    status_code=200,
+    tags=["calibration"],
+    summary="Preview one measurement-fragment revision without storing it",
+)
+def preview_event(batch_id: str, event: MeasurementEvent) -> PreviewResponse:
+    if event.batch_id != batch_id:
+        raise HTTPException(
+            status_code=422,
+            detail="batch_id in path and body must match",
+        )
+    stored = StoredEvent(
+        batch_id=event.batch_id,
+        sensor_id=event.sensor_id,
+        revision_id=event.revision_id,
+        parent_id=event.parent_id,
+        idempotency_key=event.idempotency_key,
+        start_ns=event.start_ns,
+        end_ns=event.end_ns,
+        value=None if event.withdrawn else float(event.value),
+        unit=event.unit,
+        withdrawn=event.withdrawn,
+    )
+    # One lock acquisition for the whole decision + evaluation: the preview is
+    # computed against one consistent batch snapshot, the same guarantee a
+    # concurrent real submission gets.
+    with store.lock:
+        status = store.classify_submission(stored)
+        batch = store.get_batch(batch_id)
+        if status == "duplicate":
+            # An exact replay changes nothing: before and after are the same
+            # snapshot and no key is occupied by the preview itself. A batch
+            # that does not exist yet is evaluated as an empty batch.
+            snapshot = batch if batch is not None and batch.events else BatchStore()
+            result = evaluate_batch(batch_id, snapshot)
+            return PreviewResponse(
+                status="duplicate",
+                idempotency_key=event.idempotency_key,
+                batch_id=batch_id,
+                sensor_id=event.sensor_id,
+                revision_id=event.revision_id,
+                before_timeline_hash=result["timeline_hash"],
+                after_timeline_hash=result["timeline_hash"],
+                before=BatchResult(**result),
+                after=BatchResult(**result),
+            )
+        doc = preview_submission(batch_id, stored, batch)
+    return PreviewResponse(**doc)
 
 
 @app.get(

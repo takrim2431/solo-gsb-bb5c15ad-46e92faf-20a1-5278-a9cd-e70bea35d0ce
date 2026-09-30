@@ -474,6 +474,161 @@ def evaluate_batch(batch_id: str, store: BatchStore) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Submission preview (non-mutating)
+# ---------------------------------------------------------------------------
+
+# Effective-state change kinds emitted by the half-open preview diff.
+ADDED = "added"
+REMOVED = "removed"
+CHANGED = "changed"
+
+
+def folded_sensor_segments(
+    sensor_events: dict[str, StoredEvent],
+    states: dict[str, str],
+    depths: dict[str, int],
+) -> list[Segment]:
+    """Fold the grounded revisions of one sensor exactly like the batch result."""
+    grounded_events = [
+        e for e in sensor_events.values() if states[e.revision_id] == GROUNDED
+    ]
+    return build_timeline(grounded_events, depths)
+
+
+def diff_effective_intervals(
+    before: list[Segment], after: list[Segment]
+) -> list[dict]:
+    """Half-open diff of effective (state/value/unit) coverage between folds.
+
+    Mirrors :func:`compare_segments`, except the two sides represent the same
+    sensor before and after a hypothetical submission and every returned
+    interval carries a change kind:
+
+    * ``added``   - uncovered before, covered after;
+    * ``removed`` - covered before, uncovered after;
+    * ``changed`` - covered on both sides but state/value/unit differ.
+
+    Spans whose effective payload is unchanged (including spans where only the
+    winning revision id changes) are not reported. Adjacent elementary spans
+    with identical kind and payloads merge, so the output is a contiguous,
+    time-sorted partition of the *changed* part of the union coverage span.
+    """
+    points = sorted({p for seg in before + after for p in (seg.start_ns, seg.end_ns)})
+    intervals: list[dict] = []
+    bi = ai = 0
+    for lo, hi in zip(points, points[1:]):
+        while bi < len(before) and before[bi].end_ns <= lo:
+            bi += 1
+        while ai < len(after) and after[ai].end_ns <= lo:
+            ai += 1
+        bseg = before[bi] if bi < len(before) and before[bi].start_ns <= lo else None
+        aseg = after[ai] if ai < len(after) and after[ai].start_ns <= lo else None
+        before_payload = _side_payload(bseg)
+        after_payload = _side_payload(aseg)
+        if before_payload == after_payload:
+            continue
+        if before_payload is None:
+            kind = ADDED
+        elif after_payload is None:
+            kind = REMOVED
+        else:
+            kind = CHANGED
+        if (
+            intervals
+            and intervals[-1]["end_ns"] == lo
+            and intervals[-1]["kind"] == kind
+            and intervals[-1]["before"] == before_payload
+            and intervals[-1]["after"] == after_payload
+        ):
+            intervals[-1]["end_ns"] = hi
+        else:
+            intervals.append(
+                {
+                    "start_ns": lo,
+                    "end_ns": hi,
+                    "kind": kind,
+                    "before": before_payload,
+                    "after": after_payload,
+                }
+            )
+    return intervals
+
+
+def preview_submission(
+    batch_id: str, event: StoredEvent, store: Optional[BatchStore]
+) -> dict:
+    """Compute the effect a submission would have, without writing anything.
+
+    Uses the exact validation/idempotency/fold rules of a real submission
+    (the caller first classifies via :meth:`EventStore.classify_submission`),
+    evaluates the batch as it is now and as it would be with the candidate
+    appended, and derives the effective-state change intervals plus the
+    missing-parent gap deltas for the candidate's sensor. A batch that does
+    not exist yet is treated as an empty batch.
+    """
+    before_doc = (
+        evaluate_batch(batch_id, store)
+        if store is not None and store.events
+        else evaluate_batch(batch_id, BatchStore())
+    )
+
+    virtual = BatchStore()
+    if store is not None:
+        virtual.events = dict(store.events)
+        virtual.revision_sensor = dict(store.revision_sensor)
+        virtual.idempotency = dict(store.idempotency)
+    virtual.events[event.revision_id] = event
+    virtual.revision_sensor[event.revision_id] = event.sensor_id
+    # Do NOT register the idempotency key: previews must not occupy it.
+    after_doc = evaluate_batch(batch_id, virtual)
+
+    sensor_id = event.sensor_id
+    before_events = {
+        rev: e
+        for rev, e in virtual.events.items()
+        if e.sensor_id == sensor_id and rev != event.revision_id
+    }
+    after_events = {
+        rev: e for rev, e in virtual.events.items() if e.sensor_id == sensor_id
+    }
+    before_states, before_depths = classify_sensor(before_events)
+    after_states, after_depths = classify_sensor(after_events)
+    before_segments = folded_sensor_segments(
+        before_events, before_states, before_depths
+    )
+    after_segments = folded_sensor_segments(after_events, after_states, after_depths)
+    changed_intervals = diff_effective_intervals(before_segments, after_segments)
+
+    before_gaps = {
+        (g["sensor_id"], g["missing_revision_id"]): g
+        for g in before_doc["gaps"]
+        if g["sensor_id"] == sensor_id
+    }
+    after_gaps = {
+        (g["sensor_id"], g["missing_revision_id"]): g
+        for g in after_doc["gaps"]
+        if g["sensor_id"] == sensor_id
+    }
+    gaps_added = [after_gaps[key] for key in sorted(after_gaps.keys() - before_gaps)]
+    gaps_removed = [before_gaps[key] for key in sorted(before_gaps.keys() - after_gaps)]
+
+    return {
+        "status": "submittable",
+        "idempotency_key": event.idempotency_key,
+        "batch_id": batch_id,
+        "sensor_id": sensor_id,
+        "revision_id": event.revision_id,
+        "before": before_doc,
+        "after": after_doc,
+        "before_timeline_hash": before_doc["timeline_hash"],
+        "after_timeline_hash": after_doc["timeline_hash"],
+        "changed_intervals": changed_intervals,
+        "gaps_added": gaps_added,
+        "gaps_removed": gaps_removed,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Cross-batch comparison
 # ---------------------------------------------------------------------------
 
@@ -503,8 +658,9 @@ def find_sensor_events(
 def _side_payload(seg: Optional[Segment]) -> Optional[dict]:
     """Effective state one side contributes on a diff span (``None``=uncovered).
 
-    Provenance (revision id) is deliberately excluded: the diff compares
-    effective calibration state only.
+    Shared by the cross-batch compare and the before/after submission preview
+    scans. Provenance (revision id) is deliberately excluded: both scans
+    compare effective calibration state only.
     """
     if seg is None:
         return None

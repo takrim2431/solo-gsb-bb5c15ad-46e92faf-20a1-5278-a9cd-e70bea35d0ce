@@ -102,6 +102,35 @@ class EventStore:
             batch.idempotency[event.idempotency_key] = canonical
             return "accepted"
 
+    def classify_submission(self, event: StoredEvent) -> str:
+        """Decide what ``add`` would decide, without changing any state.
+
+        Returns ``"submittable"`` when the event would be newly accepted or
+        ``"duplicate"`` when the exact event (same idempotency key and payload,
+        or the same revision with identical content under another key) is
+        already stored. Raises :class:`IdempotencyConflict` exactly where
+        :meth:`add` would. No idempotency key is registered and no batch entry
+        is created, so previews leave no trace.
+        """
+        with self._lock:
+            batch = self._batches.get(event.batch_id)
+            canonical = canonical_event(event)
+
+            if batch is not None:
+                previous = batch.idempotency.get(event.idempotency_key)
+                if previous is not None:
+                    if previous == canonical:
+                        return "duplicate"
+                    raise IdempotencyConflict(event.idempotency_key)
+
+                existing = batch.events.get(event.revision_id)
+                if existing is not None:
+                    if canonical_event(existing) != canonical:
+                        raise IdempotencyConflict(event.idempotency_key)
+                    return "duplicate"
+
+            return "submittable"
+
     def reset(self) -> tuple[int, int]:
         with self._lock:
             batches_removed = len(self._batches)

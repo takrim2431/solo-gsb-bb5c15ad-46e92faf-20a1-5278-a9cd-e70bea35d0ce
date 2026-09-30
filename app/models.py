@@ -264,6 +264,49 @@ class IngestResponse(StrictModel):
     result: BatchResult
 
 
+class PreviewChangeInterval(StrictModel):
+    """One half-open span whose effective state/value/unit changes if submitted.
+
+    Revision provenance is ignored: a span whose only difference is the
+    winning ``revision_id`` is not reported.
+    """
+
+    start_ns: int
+    end_ns: int
+    # added:   uncovered before, covered after;
+    # removed: covered before, uncovered after;
+    # changed: covered on both sides but state/value/unit differ.
+    kind: Literal["added", "removed", "changed"]
+    # Effective payload on the span before/after the hypothetical submission;
+    # null where that side is uncovered.
+    before: Optional[CompareSide] = None
+    after: Optional[CompareSide] = None
+
+
+class PreviewResponse(StrictModel):
+    """Non-mutating impact preview of one measurement-fragment revision."""
+
+    # submittable: the event would be newly accepted;
+    # duplicate:   the exact event (or its revision content) is already stored.
+    status: Literal["submittable", "duplicate"]
+    idempotency_key: str
+    batch_id: str
+    sensor_id: str
+    revision_id: str
+    # Batch timeline hash before and after the hypothetical submission.
+    before_timeline_hash: str
+    after_timeline_hash: str
+    # Full deterministic batch results for both snapshots, for convenience.
+    before: BatchResult
+    after: BatchResult
+    # Half-open intervals of this sensor whose effective state/value/unit
+    # changes (provenance-only changes are excluded); empty for duplicates.
+    changed_intervals: list[PreviewChangeInterval] = Field(default_factory=list)
+    # Missing-parent gaps that would appear / disappear for this sensor.
+    gaps_added: list[Gap] = Field(default_factory=list)
+    gaps_removed: list[Gap] = Field(default_factory=list)
+
+
 class ResetResponse(StrictModel):
     status: Literal["reset"]
     batches_removed: int
